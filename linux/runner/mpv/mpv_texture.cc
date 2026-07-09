@@ -167,6 +167,11 @@ static gboolean mpv_texture_populate(
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
   glFlush();
 
+  // Vsync feedback for display-resample: Flutter swaps this texture to the
+  // screen right after populate() returns, so this is the closest observable
+  // point to the real swap.
+  self->player->ReportSwap();
+
   // Restore Flutter's context
   eglMakeCurrent(flutter_display, flutter_draw, flutter_read, flutter_context);
 

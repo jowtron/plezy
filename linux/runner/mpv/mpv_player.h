@@ -100,6 +100,9 @@ class MpvPlayer {
   /// Renders a frame to the specified FBO.
   void Render(int width, int height, int fbo = 0);
 
+  /// Reports a display swap to mpv (vsync feedback for display-resample).
+  void ReportSwap();
+
   /// Reports that the mouse has moved.
   void ReportMouseMove(int x, int y);
 
@@ -155,6 +158,14 @@ class MpvPlayer {
 
   std::atomic<bool> needs_redraw_{false};
   std::atomic<bool> disposed_{false};
+
+  // Last size actually rendered by mpv; a mismatch means the FBO was recreated
+  // and the vsync-repeat fast path in Render() must not skip the render.
+  int last_render_width_ = 0;
+  int last_render_height_ = 0;
+
+  // TEST INSTRUMENTATION (drop before upstream PR): pacing heartbeat source.
+  guint metrics_timer_id_ = 0;
   EventCallback event_callback_;
   RedrawCallback redraw_callback_;
   std::mutex callback_mutex_;

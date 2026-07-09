@@ -53,6 +53,18 @@ bool MpvPlayer::Initialize() {
     // Configure mpv for embedded playback.
     mpv_set_option_string(mpv_, "vo", "libmpv");
     mpv_set_option_string(mpv_, "hwdec", "auto");
+    // Lock frame presentation to the display cadence instead of the audio
+    // clock. With the swap feedback below (mpv_render_context_report_swap in
+    // the texture populate path) mpv can plan which vsync each frame lands on,
+    // giving e.g. 25 fps content a stable 2:3 pattern on a 60 Hz display.
+    // mpv silently falls back to the default audio-clock sync if swap timing
+    // is unavailable, so this is safe on setups without reliable feedback.
+    mpv_set_option_string(mpv_, "video-sync", "display-resample");
+    // The default downscale kernel (mitchell) blows the frame budget on weak
+    // GPUs when the video is larger than the surface: on an Intel HD 505,
+    // 4K25 -> 1080p dropped ~5 frames/sec with mitchell (mpv's VO drop
+    // counter) and zero with bilinear. Upscaling (--scale) keeps the default.
+    mpv_set_option_string(mpv_, "dscale", "bilinear");
   }
   mpv_set_option_string(mpv_, "keep-open", "yes");
 
@@ -79,6 +91,39 @@ bool MpvPlayer::Initialize() {
     mpv_ = nullptr;
     return false;
   }
+
+  // TEST HOOK (drop before upstream PR): override pacing options at runtime
+  // without a rebuild, e.g. `video-sync=audio` to A/B sync modes.
+  if (g_file_test("/tmp/plezy-mpv-test.conf", G_FILE_TEST_EXISTS)) {
+    int conf_err = mpv_load_config_file(mpv_, "/tmp/plezy-mpv-test.conf");
+    g_message("MPV: test conf load: %s", mpv_error_string(conf_err));
+  }
+
+  // TEST INSTRUMENTATION (drop before upstream PR): 5 s pacing heartbeat so
+  // in-process frame timing can be compared against standalone mpv baselines.
+  metrics_timer_id_ = g_timeout_add_seconds(
+      5,
+      [](gpointer data) -> gboolean {
+        auto* p = static_cast<MpvPlayer*>(data);
+        if (p->disposed_ || !p->mpv_) {
+          p->metrics_timer_id_ = 0;
+          return G_SOURCE_REMOVE;
+        }
+        auto get = [p](const char* name) -> std::string {
+          char* v = mpv_get_property_string(p->mpv_, name);
+          std::string s = v ? v : "na";
+          if (v) mpv_free(v);
+          return s;
+        };
+        std::string t = get("time-pos");
+        if (t == "na") return G_SOURCE_CONTINUE;  // not playing
+        g_message("MPV-PACE t=%s mistimed=%s vodelay=%s drops=%s vsr=%s jitter=%s dfps=%s sync=%s",
+                  t.c_str(), get("mistimed-frame-count").c_str(), get("vo-delayed-frame-count").c_str(),
+                  get("frame-drop-count").c_str(), get("vsync-ratio").c_str(), get("vsync-jitter").c_str(),
+                  get("estimated-display-fps").c_str(), get("video-sync").c_str());
+        return G_SOURCE_CONTINUE;
+      },
+      this);
 
   // Set up event wakeup callback.
   mpv_set_wakeup_callback(mpv_, OnMpvWakeup, this);
@@ -194,6 +239,27 @@ bool MpvPlayer::InitRenderContext() {
   // Set up render update callback.
   mpv_render_context_set_update_callback(mpv_gl_, OnMpvRenderUpdate, this);
 
+  // vo=libmpv cannot know the display refresh rate (it implements neither
+  // VOCTRL_GET_DISPLAY_FPS nor get_vsync), and without one mpv's display-sync
+  // modes silently stay inactive: vo_get_vsync_interval() returns -1 and
+  // handle_display_sync_frame() bails before engaging. It also cannot
+  // bootstrap from measured swap timing, since vsync sampling only starts
+  // once frames are already display-synced. Seed the rate from the
+  // compositor; mpv refines it with report_swap feedback afterwards.
+  GdkMonitor* monitor = gdk_display_get_primary_monitor(gdk_display);
+  if (!monitor && gdk_display_get_n_monitors(gdk_display) > 0) {
+    monitor = gdk_display_get_monitor(gdk_display, 0);
+  }
+  int refresh_mhz = monitor ? gdk_monitor_get_refresh_rate(monitor) : 0;
+  if (refresh_mhz > 0) {
+    char fps[32];
+    g_snprintf(fps, sizeof(fps), "%.3f", refresh_mhz / 1000.0);
+    mpv_set_option_string(mpv_, "display-fps-override", fps);
+    g_message("MPV: display-fps-override=%s (from GdkMonitor)", fps);
+  } else {
+    g_message("MPV: display refresh rate unknown; display-resample stays inactive");
+  }
+
   g_message("MPV: Render context created with isolated EGL context");
   return true;
 }
@@ -202,6 +268,11 @@ void MpvPlayer::Dispose() {
   // 1. Set disposed flag atomically FIRST — all callback paths check this
   if (disposed_.exchange(true)) {
     return;
+  }
+
+  if (metrics_timer_id_ != 0) {
+    g_source_remove(metrics_timer_id_);
+    metrics_timer_id_ = 0;
   }
 
   // 2. Clear mpv's native callbacks to prevent new ones from firing
@@ -282,6 +353,36 @@ void MpvPlayer::Dispose() {
 void MpvPlayer::Render(int width, int height, int fbo) {
   if (disposed_ || !mpv_gl_) return;
 
+  // Pure vsync repeats re-present identical pixels, so mpv's GPU render is
+  // skipped (the FBO already holds the frame) while the frame is still
+  // consumed — otherwise the VO thread's flip_page() would stall. Flutter
+  // re-composites the unchanged texture and the subsequent ReportSwap() keeps
+  // every swap sample on compositor timing. Under display-sync this cuts mpv
+  // renders from display rate (e.g. 60/s) back to video rate (e.g. 25/s),
+  // which is what weak GPUs can actually sustain. Skipping is only safe while
+  // the FBO still holds the previous render, i.e. the size didn't change.
+  if (width == last_render_width_ && height == last_render_height_) {
+    mpv_render_frame_info info{};
+    mpv_render_param info_param{MPV_RENDER_PARAM_NEXT_FRAME_INFO, &info};
+    if (mpv_render_context_get_info(mpv_gl_, info_param) >= 0 &&
+        (info.flags & MPV_RENDER_FRAME_INFO_PRESENT) &&
+        (info.flags & MPV_RENDER_FRAME_INFO_REPEAT) &&
+        !(info.flags & MPV_RENDER_FRAME_INFO_REDRAW)) {
+      int skip = 1;
+      // Without this, render() blocks until the frame's planned present time.
+      int no_block = 0;
+      mpv_render_param skip_params[] = {
+          {MPV_RENDER_PARAM_SKIP_RENDERING, &skip},
+          {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &no_block},
+          {MPV_RENDER_PARAM_INVALID, nullptr},
+      };
+      mpv_render_context_render(mpv_gl_, skip_params);
+      return;
+    }
+  }
+  last_render_width_ = width;
+  last_render_height_ = height;
+
   mpv_opengl_fbo mpv_fbo{
       .fbo = fbo,
       .w = width,
@@ -291,14 +392,33 @@ void MpvPlayer::Render(int width, int height, int fbo) {
 
   int flip_y = 0;
 
+  // BLOCK_FOR_TARGET_TIME defaults to 1, which makes render() SLEEP until the
+  // frame's planned present time — up to a full frame duration — inside
+  // Flutter's raster pass on the GTK main thread. That caps the whole
+  // present loop at ~20 cycles/s (measured: composite + sleep ≈ 50 ms) and
+  // starves input handling. Flutter's compositor is the pacing authority
+  // here, so never block.
+  int no_block = 0;
+
   mpv_render_param params[] = {
       {MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
       {MPV_RENDER_PARAM_FLIP_Y, &flip_y},
+      {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &no_block},
       {MPV_RENDER_PARAM_INVALID, nullptr},
   };
 
   mpv_render_context_render(mpv_gl_, params);
 }
+
+void MpvPlayer::ReportSwap() {
+  if (disposed_ || !mpv_gl_) return;
+  // Vsync feedback for display-resample video-sync. The true swap happens
+  // inside Flutter's rasterizer right after texture population, so reporting
+  // here is early by a constant sub-frame amount — mpv's timing uses swap
+  // *intervals*, so a constant offset does not disturb it.
+  mpv_render_context_report_swap(mpv_gl_);
+}
+
 
 void MpvPlayer::Command(const std::vector<std::string>& args) { CommandAsync(args, nullptr); }
 
@@ -473,10 +593,22 @@ void MpvPlayer::OnMpvRenderUpdate(void* ctx) {
   // render/VO thread can deadlock during disposal on Wayland: the main thread
   // blocks in mpv_render_context_free() waiting for the VO thread, while the
   // VO thread blocks in the Flutter registrar waiting for the main thread.
-  g_idle_add(
+  //
+  // G_PRIORITY_HIGH_IDLE (not default-idle): GTK processes redraws at
+  // G_PRIORITY_HIGH_IDLE + 20, so a default-priority idle only runs after the
+  // current redraw cycle completes. That delays the frame-available signal by
+  // up to a full vsync — visible as judder on low-fps content (e.g. 25 fps
+  // PAL), where each video frame must land on a stable 2:3 vsync cadence.
+  g_idle_add_full(
+      G_PRIORITY_HIGH_IDLE,
       [](gpointer data) -> gboolean {
         auto* player = static_cast<MpvPlayer*>(data);
         if (player->disposed_) return G_SOURCE_REMOVE;
+
+        // Re-arm before handling rather than after populate(): holding the
+        // flag across handling could swallow the update callback for the
+        // *next* frame under display-sync's per-vsync update cadence.
+        player->needs_redraw_.store(false);
 
         std::lock_guard<std::mutex> lock(player->callback_mutex_);
         if (player->redraw_callback_) {
@@ -484,7 +616,7 @@ void MpvPlayer::OnMpvRenderUpdate(void* ctx) {
         }
         return G_SOURCE_REMOVE;
       },
-      player);
+      player, nullptr);
 }
 
 bool MpvPlayer::ProcessEvents() {
