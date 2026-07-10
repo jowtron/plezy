@@ -161,6 +161,12 @@ static void mpv_plugin_handle_method_call(FlMethodChannel* channel, FlMethodCall
         MpvTexture* tex = self->texture;
         self->player->SetRedrawCallback([tex]() { mpv_texture_mark_frame_available(tex); });
 
+        // The render thread draws into the texture's back slot off the GTK
+        // thread; populate() then just binds the front slot. Started here so
+        // rendering doesn't depend on a populate() bootstrap.
+        self->player->SetRenderCallback([tex]() { return static_cast<int>(mpv_texture_render_back(tex)); });
+        self->player->StartRenderThread();
+
         self->initialized = TRUE;
 
         // Set up event callback

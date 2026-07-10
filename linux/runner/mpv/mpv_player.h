@@ -9,6 +9,7 @@
 #include <mpv/render_gl.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -29,6 +30,13 @@ using EventCallback = std::function<void(::_FlValue*)>;
 
 /// Callback for requesting a redraw (called from mpv render update thread).
 using RedrawCallback = std::function<void()>;
+
+/// Renders the pending mpv frame into the texture's back buffer.
+/// Runs on the player's render thread with the isolated EGL context current.
+/// Returns: <0 no render target yet (caller consumes the frame cheaply),
+///           0 frame consumed without new content (vsync repeat — no redraw),
+///          >0 new frame flipped to front (caller marks the texture).
+using RenderCallback = std::function<int()>;
 
 /// Wrapper for libmpv that handles initialization, OpenGL rendering,
 /// commands, properties, and event dispatching.
@@ -98,10 +106,32 @@ class MpvPlayer {
   void ObserveProperty(const std::string& name, const std::string& format, int id);
 
   /// Renders a frame to the specified FBO.
-  void Render(int width, int height, int fbo = 0);
+  /// Returns true if pixels were drawn into |fbo|; false if the pending frame
+  /// was a pure vsync repeat and was consumed without drawing.
+  bool Render(int width, int height, int fbo = 0);
 
   /// Reports a display swap to mpv (vsync feedback for display-resample).
   void ReportSwap();
+
+  /// Sets the callback the render thread uses to draw into the texture.
+  void SetRenderCallback(RenderCallback callback);
+
+  /// Starts the dedicated render thread (idempotent). Requires the render
+  /// context to exist. The thread owns the isolated EGL context from then on.
+  void StartRenderThread();
+
+  /// Stops and joins the render thread (idempotent). Must be called before
+  /// the texture's GL resources are destroyed.
+  void StopRenderThread();
+
+  /// Latest video surface size, reported by populate() on the GTK thread and
+  /// consumed by the render thread.
+  void SetSurfaceSize(int width, int height) {
+    surface_width_.store(width);
+    surface_height_.store(height);
+  }
+  int SurfaceWidth() const { return surface_width_.load(); }
+  int SurfaceHeight() const { return surface_height_.load(); }
 
   /// Reports that the mouse has moved.
   void ReportMouseMove(int x, int y);
@@ -168,7 +198,20 @@ class MpvPlayer {
   guint metrics_timer_id_ = 0;
   EventCallback event_callback_;
   RedrawCallback redraw_callback_;
+  RenderCallback render_callback_;
   std::mutex callback_mutex_;
+
+  // Dedicated render thread: decouples mpv's render/swap loop from Flutter's
+  // frame-clock ticks (rendering inside populate() chained every frame to the
+  // compositor cadence and could not sustain the video rate on weak GPUs).
+  std::thread render_thread_;
+  std::mutex render_thread_mutex_;
+  std::condition_variable render_cv_;
+  bool render_pending_ = false;
+  std::atomic<bool> render_thread_running_{false};
+  std::atomic<bool> render_thread_stop_{false};
+  std::atomic<int> surface_width_{0};
+  std::atomic<int> surface_height_{0};
 
   uint64_t next_reply_userdata_ = 1;
   std::map<std::string, uint64_t> observed_properties_;

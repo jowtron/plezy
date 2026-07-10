@@ -10,6 +10,7 @@
 #ifdef GDK_WINDOWING_WAYLAND
 #include <gdk/gdkwayland.h>
 #endif
+#include <chrono>
 #include <clocale>
 
 #include "sanitize_utf8.h"
@@ -275,6 +276,10 @@ void MpvPlayer::Dispose() {
     metrics_timer_id_ = 0;
   }
 
+  // Join the render thread before any render-context or GL teardown — it
+  // owns the isolated EGL context while running.
+  StopRenderThread();
+
   // 2. Clear mpv's native callbacks to prevent new ones from firing
   if (mpv_gl_) {
     mpv_render_context_set_update_callback(mpv_gl_, nullptr, nullptr);
@@ -350,17 +355,15 @@ void MpvPlayer::Dispose() {
   observed_properties_.clear();
 }
 
-void MpvPlayer::Render(int width, int height, int fbo) {
-  if (disposed_ || !mpv_gl_) return;
+bool MpvPlayer::Render(int width, int height, int fbo) {
+  if (disposed_ || !mpv_gl_) return false;
 
   // Pure vsync repeats re-present identical pixels, so mpv's GPU render is
-  // skipped (the FBO already holds the frame) while the frame is still
-  // consumed — otherwise the VO thread's flip_page() would stall. Flutter
-  // re-composites the unchanged texture and the subsequent ReportSwap() keeps
-  // every swap sample on compositor timing. Under display-sync this cuts mpv
-  // renders from display rate (e.g. 60/s) back to video rate (e.g. 25/s),
-  // which is what weak GPUs can actually sustain. Skipping is only safe while
-  // the FBO still holds the previous render, i.e. the size didn't change.
+  // skipped (the front slot already shows this frame) while the frame is
+  // still consumed — otherwise the VO thread's flip_page() would stall.
+  // Under display-sync this cuts mpv renders from display rate (e.g. 60/s)
+  // back to video rate (e.g. 25/s), which is what weak GPUs can actually
+  // sustain. Skipping is only safe while the target size didn't change.
   if (width == last_render_width_ && height == last_render_height_) {
     mpv_render_frame_info info{};
     mpv_render_param info_param{MPV_RENDER_PARAM_NEXT_FRAME_INFO, &info};
@@ -377,7 +380,7 @@ void MpvPlayer::Render(int width, int height, int fbo) {
           {MPV_RENDER_PARAM_INVALID, nullptr},
       };
       mpv_render_context_render(mpv_gl_, skip_params);
-      return;
+      return false;
     }
   }
   last_render_width_ = width;
@@ -392,30 +395,27 @@ void MpvPlayer::Render(int width, int height, int fbo) {
 
   int flip_y = 0;
 
-  // BLOCK_FOR_TARGET_TIME defaults to 1, which makes render() SLEEP until the
-  // frame's planned present time — up to a full frame duration — inside
-  // Flutter's raster pass on the GTK main thread. That caps the whole
-  // present loop at ~20 cycles/s (measured: composite + sleep ≈ 50 ms) and
-  // starves input handling. Flutter's compositor is the pacing authority
-  // here, so never block.
-  int no_block = 0;
-
+  // BLOCK_FOR_TARGET_TIME stays at its default (1): mpv hands frames over
+  // ahead of their display time, and this render call sleeping until the
+  // frame's target present time is what paces the flip correctly. That is
+  // only safe because Render() runs on the dedicated render thread — on the
+  // GTK thread the same block starved the UI and capped the present loop.
   mpv_render_param params[] = {
       {MPV_RENDER_PARAM_OPENGL_FBO, &mpv_fbo},
       {MPV_RENDER_PARAM_FLIP_Y, &flip_y},
-      {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &no_block},
       {MPV_RENDER_PARAM_INVALID, nullptr},
   };
 
   mpv_render_context_render(mpv_gl_, params);
+  return true;
 }
 
 void MpvPlayer::ReportSwap() {
   if (disposed_ || !mpv_gl_) return;
-  // Vsync feedback for display-resample video-sync. The true swap happens
-  // inside Flutter's rasterizer right after texture population, so reporting
-  // here is early by a constant sub-frame amount — mpv's timing uses swap
-  // *intervals*, so a constant offset does not disturb it.
+  // Swap feedback for mpv's frame timing. Reported by the render thread right
+  // after the frame lands in the front slot — mpv's timing uses swap
+  // *intervals*, so the constant compositor latency after this point does not
+  // disturb it.
   mpv_render_context_report_swap(mpv_gl_);
 }
 
@@ -556,6 +556,92 @@ void MpvPlayer::SetRedrawCallback(RedrawCallback callback) {
   redraw_callback_ = std::move(callback);
 }
 
+void MpvPlayer::SetRenderCallback(RenderCallback callback) {
+  std::lock_guard<std::mutex> lock(callback_mutex_);
+  render_callback_ = std::move(callback);
+}
+
+void MpvPlayer::StartRenderThread() {
+  if (audio_only_ || disposed_ || !mpv_gl_) return;
+  if (render_thread_running_.exchange(true)) return;
+  render_thread_stop_.store(false);
+
+  render_thread_ = std::thread([this]() {
+    // This thread owns the isolated EGL context from here until it exits.
+    // (populate() never makes it current anymore.)
+    eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context_);
+
+    // Snapshot the callback once — taking callback_mutex_ per frame would
+    // contend with the GTK thread's redraw dispatch for a render duration.
+    RenderCallback render_cb;
+    {
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      render_cb = render_callback_;
+    }
+    constexpr int kNoTarget = -1;
+
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lk(render_thread_mutex_);
+        render_cv_.wait_for(lk, std::chrono::milliseconds(100),
+                            [this] { return render_pending_ || render_thread_stop_.load(); });
+        render_pending_ = false;
+      }
+      if (render_thread_stop_.load() || disposed_) break;
+      if (!mpv_gl_) continue;
+
+      uint64_t flags = mpv_render_context_update(mpv_gl_);
+      if (!(flags & MPV_RENDER_UPDATE_FRAME)) continue;
+
+      int result = render_cb ? render_cb() : kNoTarget;
+      if (result < 0) {
+        // No render target yet (surface size unknown) — consume the frame so
+        // the VO thread's flip_page() doesn't stall waiting on us.
+        int skip = 1;
+        int no_block = 0;
+        mpv_render_param params[] = {
+            {MPV_RENDER_PARAM_SKIP_RENDERING, &skip},
+            {MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, &no_block},
+            {MPV_RENDER_PARAM_INVALID, nullptr},
+        };
+        mpv_render_context_render(mpv_gl_, params);
+      }
+      ReportSwap();
+
+      if (result > 0 && !disposed_) {
+        // Tell Flutter a new front buffer exists. The registrar must be
+        // poked from the main thread (see OnMpvRenderUpdate).
+        g_idle_add_full(
+            G_PRIORITY_HIGH_IDLE,
+            [](gpointer data) -> gboolean {
+              auto* p = static_cast<MpvPlayer*>(data);
+              if (p->disposed_) return G_SOURCE_REMOVE;
+              std::lock_guard<std::mutex> lock(p->callback_mutex_);
+              if (p->redraw_callback_) {
+                p->redraw_callback_();
+              }
+              return G_SOURCE_REMOVE;
+            },
+            this, nullptr);
+      }
+    }
+
+    eglMakeCurrent(egl_display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  });
+}
+
+void MpvPlayer::StopRenderThread() {
+  if (!render_thread_running_.exchange(false)) return;
+  {
+    std::lock_guard<std::mutex> lk(render_thread_mutex_);
+    render_thread_stop_.store(true);
+  }
+  render_cv_.notify_all();
+  if (render_thread_.joinable()) {
+    render_thread_.join();
+  }
+}
+
 void MpvPlayer::SetLogLevel(const std::string& level) {
   if (disposed_ || !mpv_) return;
   mpv_request_log_messages(mpv_, level.c_str());
@@ -583,6 +669,19 @@ void MpvPlayer::OnMpvRenderUpdate(void* ctx) {
   auto* player = static_cast<MpvPlayer*>(ctx);
   if (player->disposed_) return;
 
+  // Normal path: wake the dedicated render thread. It renders off the GTK
+  // thread and outside Flutter's frame-clock cadence, then marks the texture.
+  if (player->render_thread_running_.load()) {
+    {
+      std::lock_guard<std::mutex> lk(player->render_thread_mutex_);
+      player->render_pending_ = true;
+    }
+    player->render_cv_.notify_one();
+    return;
+  }
+
+  // Fallback (render thread not started yet): schedule a redraw so Flutter
+  // populates once and the pipeline can bootstrap.
   bool expected = false;
   if (!player->needs_redraw_.compare_exchange_strong(expected, true)) {
     return;

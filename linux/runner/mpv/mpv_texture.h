@@ -17,6 +17,13 @@ MpvTexture* mpv_texture_new(mpv::MpvPlayer* player, FlTextureRegistrar* registra
 /// Notifies Flutter that a new frame is available.
 void mpv_texture_mark_frame_available(MpvTexture* self);
 
+/// Renders the pending mpv frame into the back slot and flips it to front.
+/// Must run on the player's render thread with the isolated EGL context
+/// current. Returns <0 if there is no usable render target yet, 0 if the
+/// frame was a vsync repeat (consumed, nothing new to show), >0 if a new
+/// frame was flipped to front.
+gint mpv_texture_render_back(MpvTexture* self);
+
 /// Cleans up GL resources (FBO/texture).
 void mpv_texture_dispose(MpvTexture* self);
 
